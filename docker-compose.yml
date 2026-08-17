@@ -1,0 +1,116 @@
+services:
+  
+  ocr:
+    build:
+      context: ./ocr
+      dockerfile: Dockerfile
+      args:
+        HF_TOKEN: ${HF_TOKEN}
+    image: ocr-service:gpu
+    container_name: ocr-service
+    restart: unless-stopped
+    ports:
+      - "8100:8000"
+    env_file: ./ocr/.env
+    environment:
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./dots_ocr/weights:/app/dots_ocr/weights
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  embedding:
+    build:
+      context: ./embedding
+      dockerfile: Dockerfile
+    image: embedding-service:latest
+    container_name: embedding-service
+    restart: unless-stopped
+
+    ports:
+      - "${embedding_port:-8001}:8001"
+
+    volumes:
+      # Mount the shared weights folder from host into the container cache.
+      # Host path  : ${weights_dir}
+      # Inside container: /app/cache
+      # The engine uses _get_local_snapshot_path() to find the latest snapshot.
+      - /home/ubuntu/.cache/huggingface:/app/cache
+
+    env_file:
+      - ./embedding/.env
+
+    environment:
+      - TRANSFORMERS_OFFLINE=0
+      - HF_HUB_OFFLINE=0
+      - HF_HOME=/app/cache
+      - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-Alibaba-NLP/gte-multilingual-base}
+
+    # ── GPU support (requires nvidia-container-toolkit on the host) ──
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+  
+  asr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kemet-asr:latest
+    container_name: asr
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${asr_port:-9009}:9009"
+    volumes:
+      # Model weights live on the host and are mounted in, so a rebuild never
+      # re-downloads several GB of Whisper / pyannote checkpoints.
+      - "${weights_dir:-./cache}:/app/cache"
+    environment:
+      HF_HOME: /app/cache
+      asr_port: 9009
+    # Worker processes talk to the parent over multiprocessing queues, which are
+    # backed by POSIX shared memory — the 64 MB default is not enough headroom
+    # for the audio buffers being passed around.
+    shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9009/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
